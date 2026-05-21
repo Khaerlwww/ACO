@@ -1,6 +1,41 @@
 import { ethers } from "ethers";
 
 /**
+ * Daftar nama fungsi yang berpotensi disalahgunakan untuk drainer/skema
+ * pencurian aset. Skrip akan menolak `MINT_FN` yang nama fungsinya
+ * (case-insensitive) ada di sini, kecuali user secara eksplisit set
+ * `ALLOW_DANGEROUS_FN=true` di .env.
+ */
+const DANGEROUS_FN_NAMES = new Set(
+  [
+    // Token approval (vektor utama wallet drainer)
+    "approve",
+    "increaseallowance",
+    "setapprovalforall",
+    "permit",
+    "permitforall",
+    // Transfer keluar dari wallet
+    "transfer",
+    "transferfrom",
+    "safetransferfrom",
+    // Penghancuran token
+    "burn",
+    "burnfrom",
+    // Pengambilan dana / kontrol
+    "withdraw",
+    "withdrawall",
+    "withdrawto",
+    "transferownership",
+    "renounceownership",
+    // Eksekusi arbitrer
+    "execute",
+    "exectransaction",
+    "multicall",
+    "delegate",
+  ].map((s) => s.toLowerCase())
+);
+
+/**
  * Resolusi alamat target. Mendukung dua bentuk input:
  *   - Alamat checksum/lowercase (`0x...`)
  *   - Nama ENS (`azuki.eth`, dll.)
@@ -29,7 +64,8 @@ async function resolveAddress(provider, input) {
  * pengguna. ABI minimal ini dipakai untuk mencegah skrip memanggil
  * fungsi lain di luar yang diinginkan.
  */
-export async function loadTarget(provider, addressOrEns, mintFnSig) {
+export async function loadTarget(provider, addressOrEns, mintFnSig, opts = {}) {
+  const { allowDangerousFn = false } = opts;
   const address = await resolveAddress(provider, addressOrEns);
 
   const code = await provider.getCode(address);
@@ -62,6 +98,19 @@ export async function loadTarget(provider, addressOrEns, mintFnSig) {
   }
   if (!fragment || fragment.type !== "function") {
     throw new Error(`MINT_FN harus berupa fungsi, dapat: ${fragment?.type}`);
+  }
+
+  // Cegah penyalahgunaan: tolak fungsi yang biasa dipakai drainer/scam
+  if (
+    !allowDangerousFn &&
+    DANGEROUS_FN_NAMES.has(fragment.name.toLowerCase())
+  ) {
+    throw new Error(
+      `MINT_FN "${fragment.name}" adalah fungsi yang berpotensi berbahaya ` +
+        `(approval, transfer, burn, withdraw, atau execute arbitrer). ` +
+        `Skrip ini hanya untuk MINT NFT, bukan untuk operasi tersebut. ` +
+        `Kalau Anda yakin tahu apa yang Anda lakukan, set ALLOW_DANGEROUS_FN=true di .env.`
+    );
   }
 
   return {

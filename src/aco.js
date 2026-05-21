@@ -39,17 +39,53 @@ function fmtGwei(v) {
 }
 
 /**
- * Hanya redact API key (segmen path terakhir) jika URL terlihat punya key.
- * Jaga host & jalur publik tetap terlihat untuk debugging.
+ * Daftar query parameter yang umum berisi API key/token; harus disensor.
+ */
+const SENSITIVE_QUERY_KEYS = new Set([
+  "key",
+  "apikey",
+  "api_key",
+  "api-key",
+  "token",
+  "auth",
+  "secret",
+  "access_token",
+  "accesstoken",
+  "password",
+]);
+
+/**
+ * Sensor RPC URL untuk logging:
+ *   1. Hapus basic auth (`user:pass@host`)
+ *   2. Sensor segmen path terakhir kalau panjang (≥16 char) — pola Alchemy/Infura
+ *   3. Sensor query param yang nama key-nya umum dipakai untuk credential
+ *
+ * Host & path publik tetap terlihat untuk debugging.
  */
 function redactRpc(url) {
   try {
     const u = new URL(url);
+
+    // 1. Strip basic auth credentials
+    if (u.username || u.password) {
+      u.username = "<redacted>";
+      u.password = "";
+    }
+
+    // 2. Redact path segment terakhir kalau panjang (kemungkinan API key)
     const segs = u.pathname.split("/").filter(Boolean);
     if (segs.length > 0 && segs[segs.length - 1].length >= 16) {
       segs[segs.length - 1] = "<redacted>";
       u.pathname = "/" + segs.join("/");
     }
+
+    // 3. Redact sensitive query parameters
+    for (const k of Array.from(u.searchParams.keys())) {
+      if (SENSITIVE_QUERY_KEYS.has(k.toLowerCase())) {
+        u.searchParams.set(k, "<redacted>");
+      }
+    }
+
     return u.toString();
   } catch {
     return url;
@@ -58,7 +94,9 @@ function redactRpc(url) {
 
 export async function runAco(cfg, { send }) {
   const { provider, wallet } = await buildProviderAndWallet(cfg);
-  const target = await loadTarget(provider, cfg.nftContract, cfg.mintFn);
+  const target = await loadTarget(provider, cfg.nftContract, cfg.mintFn, {
+    allowDangerousFn: cfg.allowDangerousFn,
+  });
   const args = buildArgs(cfg.mintArgs, target.fragment, wallet.address);
 
   const value =
@@ -127,6 +165,16 @@ export async function runAco(cfg, { send }) {
   if (!send) {
     console.log("\n[dry-run] simulasi sukses. Jalankan ulang dengan --send untuk broadcast.");
     return { dryRun: true };
+  }
+
+  // Gerbang ekstra di luar --send: cegah broadcast tidak sengaja.
+  // User wajib eksplisit set LIVE_MINT_APPROVED=yes di .env.
+  if (!cfg.liveMintApproved) {
+    throw new Error(
+      "Broadcast diblokir oleh hardening gate. " +
+        "Untuk mengirim transaksi, set LIVE_MINT_APPROVED=yes di .env DAN gunakan --send. " +
+        "Ini lapisan kedua di atas konfirmasi y/N untuk mencegah eksekusi tidak sengaja."
+    );
   }
 
   const ok = await confirm(

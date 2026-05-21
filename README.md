@@ -180,6 +180,56 @@ Transaksi yang dikirim lewat endpoint ini **tidak masuk mempool publik**, sehing
 - **Cek saldo otomatis.** Skrip menolak mengirim kalau saldo wallet < estimasi total biaya.
 - **Tidak ada retry untuk revert nyata.** Hanya error transien yang di-retry.
 
+## Hardening Production
+
+Untuk mengurangi risiko eksekusi tidak sengaja & penyalahgunaan konfigurasi:
+
+### 1. Gerbang ganda untuk broadcast
+
+Untuk mengirim transaksi nyata, **dua hal wajib aktif bersamaan**:
+
+```bash
+# Di .env
+LIVE_MINT_APPROVED=yes
+
+# Di terminal
+npm run send
+```
+
+Tanpa salah satunya, broadcast diblokir. Ini mencegah skenario seperti:
+- Anda sengaja jalankan `npm run send` saat sebenarnya ingin `npm run dry`.
+- Otomatisasi/CI yang tidak sengaja memicu broadcast.
+
+### 2. Denylist fungsi berbahaya
+
+Skrip menolak `MINT_FN` yang nama fungsinya termasuk:
+
+| Kategori | Contoh fungsi |
+| --- | --- |
+| Persetujuan token | `approve`, `setApprovalForAll`, `permit`, `increaseAllowance` |
+| Transfer keluar | `transfer`, `transferFrom`, `safeTransferFrom` |
+| Penghancuran | `burn`, `burnFrom` |
+| Penarikan dana | `withdraw`, `withdrawAll`, `withdrawTo` |
+| Kontrol kontrak | `transferOwnership`, `renounceOwnership`, `delegate` |
+| Eksekusi arbitrer | `execute`, `execTransaction`, `multicall` |
+
+Ini mencegah skenario di mana attacker mengarahkan Anda untuk set `MINT_FN=approve(address,uint256)` dengan spender attacker.
+
+Kalau Anda yakin butuh fungsi ini, set `ALLOW_DANGEROUS_FN=true` di `.env`. **Disarankan tidak.**
+
+### 3. Sensor RPC URL pada output
+
+Output skrip otomatis menyensor:
+- _Basic auth_ di URL (`user:pass@host`)
+- _Path segment_ panjang (≥16 karakter — pola Alchemy/Infura key)
+- _Query parameter_: `key`, `apikey`, `api_key`, `token`, `auth`, `secret`, `access_token`, `password`
+
+Aman untuk _share_ keluaran terminal saat _troubleshooting_.
+
+### 4. Lockfile dependency
+
+Repo ini menyertakan `package-lock.json` agar `npm install` selalu menghasilkan _dependency tree_ yang sama (mencegah _supply-chain attack_ via versi transitive yang berubah). Kalau Anda butuh _override_, gunakan `npm ci` daripada `npm install` di lingkungan production.
+
 ## Pemecahan Masalah
 
 | Pesan error | Penyebab umum | Solusi |
@@ -193,6 +243,8 @@ Transaksi yang dikirim lewat endpoint ini **tidak masuk mempool publik**, sehing
 | `Total biaya ... melebihi batas` | Gas + value > `MAX_TOTAL_COST_ETH`. | Sesuaikan batas atau kurangi `QUANTITY`. |
 | `Saldo wallet ... kurang dari estimasi` | Burner wallet kurang ETH. | Top up wallet dengan ETH yang cukup. |
 | `Jumlah argumen tidak cocok` | `MINT_ARGS` jumlahnya salah. | Hitung ulang sesuai `MINT_FN`. |
+| `Broadcast diblokir oleh hardening gate` | `LIVE_MINT_APPROVED` belum di-set. | Set `LIVE_MINT_APPROVED=yes` di `.env` (lihat [Hardening](#hardening-production)). |
+| `MINT_FN ... adalah fungsi yang berpotensi berbahaya` | Anda menulis fungsi non-mint (mis. `approve`). | Pastikan `MINT_FN` adalah fungsi mint kontrak. Kalau memang sengaja, set `ALLOW_DANGEROUS_FN=true`. |
 
 ## Lisensi
 

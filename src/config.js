@@ -68,5 +68,13 @@ export function loadConfig() {
 
     // MEV protection (informasi saja; aktif jika RPC_URL = endpoint Flashbots Protect)
     usingFlashbotsProtect: bool("USING_FLASHBOTS_PROTECT", false),
+
+    // Hardening: gerbang ekstra di luar --send untuk mencegah eksekusi
+    // tidak sengaja. Wajib `true` untuk bisa broadcast.
+    liveMintApproved: bool("LIVE_MINT_APPROVED", false),
+
+    // Hardening: izinkan MINT_FN yang berpotensi berbahaya (approve,
+    // setApprovalForAll, dll). Default false; kalau Anda yakin, set true.
+    allowDangerousFn: bool("ALLOW_DANGEROUS_FN", false),
   };
 }
