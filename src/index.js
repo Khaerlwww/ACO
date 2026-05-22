@@ -1,39 +1,44 @@
 #!/usr/bin/env node
 import { loadConfig } from "./config.js";
-import { runAco } from "./aco.js";
-
-function parseArgs(argv) {
-  const args = { send: false };
-  for (const a of argv.slice(2)) {
-    if (a === "--send") args.send = true;
-    else if (a === "--dry-run") args.send = false;
-    else if (a === "-h" || a === "--help") args.help = true;
-  }
-  return args;
-}
+import { runSniper } from "./sniper.js";
 
 const HELP = `
-aco-nft  -  Auto Checkout / Auto Mint NFT untuk Ethereum Mainnet (chainId = 1)
+ACO Sniper  -  Instant mint execution untuk Ethereum Mainnet (chainId = 1)
 
 Penggunaan:
-  node src/index.js              # dry-run (default): simulasi saja, tidak kirim
-  node src/index.js --send       # simulasi, tanya y/N, lalu broadcast
-  node src/index.js --dry-run    # paksa dry-run
+  npm start
+  node src/index.js
 
 Konfigurasi via .env (salin dari .env.example).
-Skrip menolak: chain != 1, alamat tanpa bytecode, simulasi revert,
-biaya melebihi batas. Selalu gunakan BURNER WALLET sesuai konvensi.
+
+Filosofi:
+  - Pre-flight (sebelum mint window): validasi chain, ABI, encode calldata,
+    cache nonce + baseFee, optional pre-sign tx.
+  - Hot path (saat trigger fire): broadcast paralel ke semua RPC, race
+    Promise.any untuk first-success. No simulation, no prompt.
+
+Trigger modes:
+  TRIGGER_MODE=immediate  - fire saat skrip dijalankan
+  TRIGGER_MODE=poll       - poll view fn sampai cocok TRIGGER_EXPECT
+  TRIGGER_MODE=timestamp  - tunggu Unix timestamp tertentu
+  TRIGGER_MODE=block      - tunggu block number tertentu
+
+Keselamatan minimum (zero hot-path overhead):
+  - Chain ID = 1 dipaku
+  - Bytecode check di pre-flight
+  - Dangerous function denylist (approve, transfer, burn, dst.)
+  - Fee cap MAX_FEE_GWEI (override via SNIPER_BYPASS_FEE_CAP=true)
+  - WAJIB pakai BURNER WALLET di PRIVATE_KEY
 `;
 
 (async () => {
-  const args = parseArgs(process.argv);
-  if (args.help) {
+  if (process.argv.includes("-h") || process.argv.includes("--help")) {
     console.log(HELP);
     return;
   }
   try {
     const cfg = loadConfig();
-    await runAco(cfg, { send: args.send });
+    await runSniper(cfg);
   } catch (err) {
     console.error("\nDIBATALKAN:", err.shortMessage || err.message);
     process.exit(1);
