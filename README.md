@@ -1,69 +1,61 @@
-# ACO
+# ACO Sniper
 
-**Auto Checkout / Auto Mint** untuk kontrak NFT di **Ethereum Mainnet**, dengan prinsip _safe-by-default_. Dibangun di atas Node.js dan [ethers v6](https://docs.ethers.org/v6/).
+**Instant mint execution** untuk kontrak NFT di **Ethereum Mainnet**. Fokus tunggal: latensi serendah mungkin saat mint window live, dengan tetap mempertahankan minimum safety yang tidak menambah hot path overhead.
 
-> **Khusus Ethereum Mainnet (chainId = 1).** Skrip ini sengaja menolak chain lain (testnet, Base, Arbitrum, dst.) untuk menghindari kesalahan konfigurasi yang tidak bisa diperbaiki setelah broadcast.
+> **Khusus Ethereum Mainnet (chainId = 1).** Skrip ini menolak chain lain.
 
-> Tujuan utama: membantu mint NFT secara cepat **tanpa** mengorbankan keamanan — tidak ada _blind signing_, tidak ada broadcast tanpa simulasi, dan tidak ada konfirmasi otomatis tanpa persetujuan pengguna.
+> Tujuan utama: **execution speed, low latency, transaction inclusion, successful mint completion.** Tidak ada simulasi, prompt, atau dry-run.
 
 ---
 
 ## Daftar Isi
 
-- [Fitur Utama](#fitur-utama)
-- [Arsitektur](#arsitektur)
+- [Filosofi](#filosofi)
 - [Persyaratan](#persyaratan)
 - [Instalasi](#instalasi)
 - [Konfigurasi](#konfigurasi)
 - [Penggunaan](#penggunaan)
-- [Strategi Biaya EIP-1559](#strategi-biaya-eip-1559)
-- [Perlindungan MEV (Flashbots Protect)](#perlindungan-mev-flashbots-protect)
-- [Aturan Keamanan](#aturan-keamanan)
+- [Trigger Modes](#trigger-modes)
+- [Hot Path Optimization](#hot-path-optimization)
+- [Safety Rails (zero hot-path overhead)](#safety-rails-zero-hot-path-overhead)
 - [Pemecahan Masalah](#pemecahan-masalah)
 - [Lisensi](#lisensi)
 
-## Fitur Utama
-
-| Fitur | Deskripsi |
-| --- | --- |
-| _Ethereum-only_ | Memvalidasi `chainId == 1` di tiap _run_; menolak chain lain. |
-| Resolusi ENS | `NFT_CONTRACT` boleh berupa nama ENS (mis. `azuki.eth`). |
-| Verifikasi bytecode | Memastikan alamat kontrak benar-benar memiliki kode. |
-| ABI minimal | Hanya fungsi mint yang Anda tulis di `.env`, mencegah _blind signing_. |
-| Simulasi `staticCall` | Mendeteksi _revert_ sebelum gas terbuang. |
-| Estimasi _tip_ via `eth_feeHistory` | Persentil ke-N dari N blok terakhir, jauh lebih akurat dari `getFeeData`. |
-| Fallback Chainlink Fast Gas | On-chain oracle dipakai otomatis jika `eth_feeHistory` tidak tersedia. |
-| Fallback `getFeeData` | Lapisan pamungkas jika feed Chainlink stale / dideprekasi. |
-| Strategi EIP-1559 | `maxFeePerGas = 2 × baseFee + tip`, dengan _hard cap_. |
-| Batas biaya keras | `MAX_FEE_GWEI`, `MAX_PRIORITY_GWEI`, `MAX_TOTAL_COST_ETH`. |
-| Cek saldo | Saldo wallet dicek vs total biaya sebelum prompt konfirmasi. |
-| Konfirmasi eksplisit | Prompt `y/N` di terminal sebelum broadcast. |
-| _Pending nonce_ | Dipakai eksplisit untuk menghindari konflik nonce yang macet. |
-| Konfirmasi multi-blok | `CONFIRMATIONS` (default 1) untuk ketahanan _reorg_. |
-| Retry cerdas | Hanya retry pada error transien (blockhash, _rate-limit_, RPC). |
-| _Etherscan link_ | Tautan kontrak dan tx otomatis dicetak. |
-| Dukungan Flashbots Protect | Cukup ganti `RPC_URL`; tx tidak melewati mempool publik. |
-
-## Arsitektur
+## Filosofi
 
 ```
-src/
-├── index.js       # Entry CLI, parsing argumen
-├── config.js      # Memuat & memvalidasi .env (chainId dipaku ke 1)
-├── provider.js    # JsonRpcProvider + Wallet, refuse jika bukan mainnet
-├── contract.js    # ENS resolve, verifikasi bytecode, ABI minimal
-├── oracle.js      # Chainlink Fast Gas oracle (deteksi stale & decommissioned)
-├── simulate.js    # staticCall, rantai fallback fee, strategi EIP-1559
-└── aco.js         # Orkestrasi: verify -> simulate -> fee plan -> confirm -> send -> retry
+┌─────── PRE-FLIGHT (sebelum mint window, latency tidak penting) ───────┐
+│  1. Validasi chain == 1                                                │
+│  2. Verifikasi bytecode kontrak                                        │
+│  3. Resolve ENS (optional)                                             │
+│  4. Build ABI minimal + dangerous fn denylist                          │
+│  5. Encode calldata                                                    │
+│  6. Validate extra RPCs (chainId per-RPC)                              │
+│  7. Cache nonce + baseFee + balance (paralel)                          │
+│  8. (Optional) Pre-sign tx                                             │
+└────────────────────────────────────────────────────────────────────────┘
+                              ↓
+                       (tunggu trigger)
+                              ↓
+┌─────── HOT PATH (saat trigger fire) ──────────────────────────────────┐
+│  Pre-sign mode (PRESIGN_TX=true):                                      │
+│    broadcast cached_signed_tx → DONE (~50ms)                           │
+│                                                                        │
+│  Live-sign mode (PRESIGN_TX=false):                                    │
+│    fetch nonce/baseFee race → sign → broadcast → DONE (~80-150ms)      │
+│                                                                        │
+│  Multi-RPC parallel broadcast dengan Promise.any first-success race.   │
+│  Fire-and-forget: return setelah hash; cek Etherscan untuk konfirmasi. │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Persyaratan
 
-- **Node.js** versi 18 atau lebih baru
-- **RPC endpoint Ethereum Mainnet** (Alchemy / Infura / Flashbots Protect / node pribadi)
+- **Node.js** 18+
+- **RPC Ethereum Mainnet** (Alchemy / Infura / Flashbots Protect / node pribadi)
 - **Burner wallet** dengan saldo cukup untuk `mint price + biaya gas`
 
-> **PENTING:** Jangan pernah menggunakan dompet utama Anda. Buat dompet baru khusus untuk operasi ini.
+> **WAJIB:** burner wallet dedicated. Kalau ada tx lain dari wallet ini antara pre-flight dan trigger fire, sniper akan gagal (terutama di mode `PRESIGN_TX=true` karena nonce di-freeze).
 
 ## Instalasi
 
@@ -72,270 +64,146 @@ git clone https://github.com/Khaerlwww/ACO.git
 cd ACO
 npm install
 cp .env.example .env
+# edit .env
 ```
 
 ## Konfigurasi
 
-Edit berkas `.env`. Variabel yang tersedia:
+### Wajib
 
-### Jaringan dan dompet
+| Variabel | Deskripsi |
+| --- | --- |
+| `RPC_URL` | RPC Ethereum Mainnet primary |
+| `PRIVATE_KEY` | Private key burner wallet |
+| `NFT_CONTRACT` | Alamat `0x...` atau ENS (mis. `azuki.eth`) |
+| `MINT_FN` | Tanda tangan fungsi mint (mis. `mint(uint256)`) |
+| `MINT_ARGS` | Argumen koma. `{WALLET}` = alamat burner |
 
-| Variabel | Wajib | Deskripsi |
-| --- | --- | --- |
-| `RPC_URL` | Ya | RPC Ethereum Mainnet. Boleh juga Flashbots Protect. |
-| `USING_FLASHBOTS_PROTECT` | Tidak | `true`/`false`, hanya untuk label di output. |
-| `PRIVATE_KEY` | Ya | _Private key_ dompet **burner** (`0x...`). |
-
-### Target NFT
-
-| Variabel | Wajib | Deskripsi |
-| --- | --- | --- |
-| `NFT_CONTRACT` | Ya | Alamat `0x...` atau nama ENS (mis. `vault.azuki.eth`). |
-| `MINT_FN` | Ya | Tanda tangan fungsi mint (lihat tabel di bawah). |
-| `MINT_ARGS` | Ya | Argumen dipisah koma. `{WALLET}` diganti alamat dompet. |
-| `MINT_PRICE_ETH` | Tidak | Harga per token dalam ETH. Default `0`. |
-| `QUANTITY` | Tidak | Jumlah token. Default `1`. |
-
-### Strategi biaya
+### Opsional
 
 | Variabel | Default | Deskripsi |
 | --- | --- | --- |
-| `MAX_FEE_GWEI` | `20` | Batas atas `maxFeePerGas`. |
-| `MAX_PRIORITY_GWEI` | `1` | Batas atas `maxPriorityFeePerGas`. |
-| `MAX_TOTAL_COST_ETH` | `0.05` | Batas atas total biaya (gas + value). |
-| `FEE_HISTORY_BLOCKS` | `20` | Jumlah blok untuk `eth_feeHistory`. |
-| `TIP_PERCENTILE` | `50` | Persentil _tip_ yang diambil dari riwayat. |
-| `USE_CHAINLINK_FALLBACK` | `true` | Aktifkan fallback ke Chainlink Fast Gas oracle. |
-| `CHAINLINK_FAST_GAS_FEED` | `0x169E...37C` | Alamat feed Chainlink Fast Gas / Gwei. |
-| `CONFIRMATIONS` | `1` | Jumlah konfirmasi sebelum dianggap final. |
-| `MAX_RETRIES` | `3` | Maksimum percobaan ulang pada error transien. |
-| `RETRY_DELAY_MS` | `1500` | Jeda antar percobaan. |
-
-### Contoh pasangan `MINT_FN` dan `MINT_ARGS`
-
-| Skenario | `MINT_FN` | `MINT_ARGS` |
-| --- | --- | --- |
-| Mint sederhana | `mint(uint256)` | `1` |
-| Mint dengan recipient | `mint(address,uint256)` | `{WALLET},1` |
-| Public mint | `publicMint(uint256)` | `1` |
-| Allowlist (tanpa proof) | `allowlistMint(uint256)` | `1` |
+| `MINT_PRICE_ETH` | `0` | Harga per token |
+| `QUANTITY` | `1` | Jumlah token |
+| `ALLOW_DANGEROUS_FN` | `false` | Izinkan MINT_FN seperti `approve` (HATI-HATI) |
+| `TRIGGER_MODE` | `immediate` | `immediate` / `poll` / `timestamp` / `block` |
+| `TRIGGER_FN` | — | View fn untuk mode poll (mis. `mintActive() returns (bool)`) |
+| `TRIGGER_EXPECT` | `true` | Nilai yang trigger fire |
+| `POLL_MS` | `200` | Interval poll (ms) |
+| `TRIGGER_TIMESTAMP` | `0` | Unix epoch detik untuk mode timestamp |
+| `TRIGGER_BLOCK` | `0` | Block number untuk mode block |
+| `EXTRA_RPC_URLS` | — | RPC tambahan (comma-separated) untuk parallel broadcast |
+| `STATIC_GAS_LIMIT` | `300000` | Gas limit statik (skip estimateGas) |
+| `MAX_FEE_GWEI` | `20` | Hard cap maxFeePerGas |
+| `SNIPER_PRIORITY_GWEI` | `3` | Priority fee untuk inclusion cepat |
+| `SNIPER_BYPASS_FEE_CAP` | `false` | Bypass `MAX_FEE_GWEI` (yolo) |
+| `PRESIGN_TX` | `false` | Pre-sign tx di pre-flight (~50-100ms saving) |
+| `PRESIGN_FEE_MULTIPLIER` | `5` | baseFee multiplier untuk pre-signed maxFee |
 
 ## Penggunaan
 
 ```bash
-# 1. Simulasi saja (tidak pernah broadcast)
-npm run dry
+npm start
+# atau
+node src/index.js
 
-# 2. Simulasi, lalu minta konfirmasi sebelum broadcast
-npm run send
-
-# 3. Lihat bantuan
+# Bantuan
 node src/index.js --help
 ```
 
-## Strategi Biaya EIP-1559
+## Trigger Modes
 
-Skrip menggunakan **rantai fallback bertingkat** untuk estimasi tip:
-
-```
-1. eth_feeHistory                         (paling akurat)
-   ↓ kalau gagal/RPC tidak dukung
-2. Chainlink Fast Gas oracle (on-chain)   (deteksi stale & decommissioned)
-   ↓ kalau gagal/feed dideprekasi
-3. provider.getFeeData()                  (lapisan terakhir)
-```
-
-Setelah tip didapat dari salah satu sumber, dihitung:
-
-```
-tip       = clamp(tip_dari_sumber, 0.01 gwei, MAX_PRIORITY_GWEI)
-maxFee    = (baseFee × 2) + tip
-```
-
-Faktor `2 ×` pada `baseFee` memberi ruang lonjakan ~6 blok ke depan: karena `baseFee` maksimum naik 12.5% per blok, batas atas pertumbuhan dalam 6 blok adalah `1.125^6 ≈ 2.03`.
-
-Jika `maxFee` melebihi `MAX_FEE_GWEI`, skrip menolak (tidak diam-diam menaikkan).
-
-## Perlindungan MEV (Flashbots Protect)
-
-Mint NFT di mainnet sering jadi sasaran _front-running_ dan _sandwich attack_. Untuk meminimalkan risiko, ganti `RPC_URL` ke endpoint **Flashbots Protect**:
-
-```
-RPC_URL=https://rpc.flashbots.net
-USING_FLASHBOTS_PROTECT=true
-```
-
-Transaksi yang dikirim lewat endpoint ini **tidak masuk mempool publik**, sehingga tidak bisa di-_sandwich_ atau diintip _searcher_.
-
-> Catatan: Flashbots Protect menambah latensi (transaksi dipublikasikan via _bundle_), jadi tidak ideal untuk mint yang super kompetitif di blok pertama.
-
-## Aturan Keamanan
-
-- **Hanya gunakan _burner wallet_.**
-- **Tidak ada `approve` / `setApprovalForAll`.**
-- **Tidak ada _blind signing_.** ABI dibangun dari fungsi tunggal yang Anda tulis sendiri.
-- **Tidak ada transmisi private key.** Kunci hanya ada di proses lokal Anda.
-- **Tidak ada bypass batas.** `MAX_FEE_GWEI`, `MAX_PRIORITY_GWEI`, `MAX_TOTAL_COST_ETH` ditegakkan sebagai _hard fail_.
-- **Chain dipaku.** Jika RPC tidak melaporkan `chainId == 1`, skrip menolak menjalankan apa pun.
-- **Cek saldo otomatis.** Skrip menolak mengirim kalau saldo wallet < estimasi total biaya.
-- **Tidak ada retry untuk revert nyata.** Hanya error transien yang di-retry.
-
-## Hardening Production
-
-Untuk mengurangi risiko eksekusi tidak sengaja & penyalahgunaan konfigurasi:
-
-### 1. Gerbang ganda untuk broadcast
-
-Untuk mengirim transaksi nyata, **dua hal wajib aktif bersamaan**:
-
-```bash
-# Di .env
-LIVE_MINT_APPROVED=yes
-
-# Di terminal
-npm run send
-```
-
-Tanpa salah satunya, broadcast diblokir. Ini mencegah skenario seperti:
-- Anda sengaja jalankan `npm run send` saat sebenarnya ingin `npm run dry`.
-- Otomatisasi/CI yang tidak sengaja memicu broadcast.
-
-### 2. Denylist fungsi berbahaya
-
-Skrip menolak `MINT_FN` yang nama fungsinya termasuk:
-
-| Kategori | Contoh fungsi |
-| --- | --- |
-| Persetujuan token | `approve`, `setApprovalForAll`, `permit`, `increaseAllowance` |
-| Transfer keluar | `transfer`, `transferFrom`, `safeTransferFrom` |
-| Penghancuran | `burn`, `burnFrom` |
-| Penarikan dana | `withdraw`, `withdrawAll`, `withdrawTo` |
-| Kontrol kontrak | `transferOwnership`, `renounceOwnership`, `delegate` |
-| Eksekusi arbitrer | `execute`, `execTransaction`, `multicall` |
-
-Ini mencegah skenario di mana attacker mengarahkan Anda untuk set `MINT_FN=approve(address,uint256)` dengan spender attacker.
-
-Kalau Anda yakin butuh fungsi ini, set `ALLOW_DANGEROUS_FN=true` di `.env`. **Disarankan tidak.**
-
-### 3. Sensor RPC URL pada output
-
-Output skrip otomatis menyensor:
-- _Basic auth_ di URL (`user:pass@host`)
-- _Path segment_ panjang (≥16 karakter — pola Alchemy/Infura key)
-- _Query parameter_: `key`, `apikey`, `api_key`, `token`, `auth`, `secret`, `access_token`, `password`
-
-Aman untuk _share_ keluaran terminal saat _troubleshooting_.
-
-### 4. Lockfile dependency
-
-Repo ini menyertakan `package-lock.json` agar `npm install` selalu menghasilkan _dependency tree_ yang sama (mencegah _supply-chain attack_ via versi transitive yang berubah). Kalau Anda butuh _override_, gunakan `npm ci` daripada `npm install` di lingkungan production.
-
-## Pemecahan Masalah
-
-| Pesan error | Penyebab umum | Solusi |
+| Mode | Perilaku | Use case |
 | --- | --- | --- |
-| `RPC bukan Ethereum Mainnet` | RPC mengarah ke L2/testnet. | Ganti `RPC_URL` ke endpoint mainnet. |
-| `PRIVATE_KEY format tidak valid` | Placeholder belum diganti. | Isi dengan private key burner asli. |
-| `Nama ENS tidak bisa diresolusi` | ENS belum terdaftar atau salah ketik. | Cek di [app.ens.domains](https://app.ens.domains). |
-| `Tidak ada bytecode di ...` | Alamat salah atau kontrak belum di-deploy. | Verifikasi di Etherscan. |
-| `Simulasi revert: ...` | Mint belum live, allowlist, supply habis, dll. | Baca pesan revert; cek status mint. |
-| `Estimasi maxFeePerGas ... melebihi batas` | Gas mainnet sedang naik. | Tunggu, atau naikkan `MAX_FEE_GWEI` jika wajar. |
-| `Total biaya ... melebihi batas` | Gas + value > `MAX_TOTAL_COST_ETH`. | Sesuaikan batas atau kurangi `QUANTITY`. |
-| `Saldo wallet ... kurang dari estimasi` | Burner wallet kurang ETH. | Top up wallet dengan ETH yang cukup. |
-| `Jumlah argumen tidak cocok` | `MINT_ARGS` jumlahnya salah. | Hitung ulang sesuai `MINT_FN`. |
-| `Broadcast diblokir oleh hardening gate` | `LIVE_MINT_APPROVED` belum di-set. | Set `LIVE_MINT_APPROVED=yes` di `.env` (lihat [Hardening](#hardening-production)). |
-| `MINT_FN ... adalah fungsi yang berpotensi berbahaya` | Anda menulis fungsi non-mint (mis. `approve`). | Pastikan `MINT_FN` adalah fungsi mint kontrak. Kalau memang sengaja, set `ALLOW_DANGEROUS_FN=true`. |
+| `immediate` | Fire langsung saat skrip dijalankan | Mint sudah live, eksekusi sekarang |
+| `poll` | Poll view fn sampai cocok `TRIGGER_EXPECT` | Tunggu `mintActive() == true` |
+| `timestamp` | Tunggu Unix timestamp | Mint scheduled jam X |
+| `block` | Tunggu block number | Mint live di block X |
 
-## Lisensi
-
-[MIT](./LICENSE)
-
-
-
----
-
-## Mode Sniper (Instant Execution)
-
-Untuk skenario di mana Anda butuh **eksekusi mint secepat mungkin** saat _mint window_ live dibuka — tanpa simulasi, tanpa prompt, tanpa _double approval_:
-
-```bash
-npm run sniper
-```
-
-### Filosofi sniper mode
-
-- **Pre-flight (sekali, sebelum mint window):** validasi chain, resolve ENS, verifikasi bytecode, _denylist check_, encode calldata, cache nonce & baseFee.
-- **Hot path (saat mint live):** refresh nonce → refresh baseFee → sign → broadcast paralel ke semua RPC.
-- **Tidak ada simulasi, prompt, atau dry-run di hot path.**
-
-Latensi tipikal hot path: ~50-200ms tergantung RPC + jaringan.
-
-### Mode trigger
-
-| `TRIGGER_MODE` | Perilaku |
-| --- | --- |
-| `immediate` | Fire langsung saat skrip dijalankan |
-| `poll` | Poll _view function_, fire saat return value cocok `TRIGGER_EXPECT` |
-| `timestamp` | Tunggu sampai `TRIGGER_TIMESTAMP` (Unix detik), lalu fire |
-| `block` | Tunggu sampai `blockNumber >= TRIGGER_BLOCK`, lalu fire |
-
-### Konfigurasi sniper
-
-| Variabel | Default | Deskripsi |
-| --- | --- | --- |
-| `TRIGGER_MODE` | `immediate` | Salah satu dari di atas |
-| `TRIGGER_FN` | `mintActive() returns (bool)` | View fn untuk mode `poll` |
-| `TRIGGER_EXPECT` | `true` | Nilai return yang men-trigger fire |
-| `POLL_MS` | `200` | Jeda antar poll dalam milidetik |
-| `TRIGGER_TIMESTAMP` | `0` | Unix epoch detik untuk mode `timestamp` |
-| `TRIGGER_BLOCK` | `0` | Block number untuk mode `block` |
-| `EXTRA_RPC_URLS` | _(kosong)_ | RPC tambahan untuk parallel broadcast (comma-separated) |
-| `STATIC_GAS_LIMIT` | `300000` | Gas limit statik (skip `estimateGas`) |
-| `SNIPER_PRIORITY_GWEI` | `3` | Priority fee untuk inclusion cepat |
-| `SNIPER_BYPASS_FEE_CAP` | `false` | Bypass `MAX_FEE_GWEI` cap (HATI-HATI) |
-| `WAIT_FOR_CONFIRMATION` | `false` | `true` = tunggu 1 konfirmasi, `false` = fire-and-forget |
-
-### Optimasi yang aktif
-
-- ⚡ **Multi-RPC parallel broadcast** — broadcast ke `RPC_URL` + semua `EXTRA_RPC_URLS` sekaligus, race siapa duluan accept
-- ⚡ **Pre-built calldata** — encoded sekali di pre-flight, dipakai ulang
-- ⚡ **Static gas limit** — skip `estimateGas` (~50-100ms saving)
-- ⚡ **Aggressive fee** — `maxFee = 3 × baseFee + tip` untuk masuk blok awal
-- ⚡ **Fire-and-forget** — return setelah RPC accept, tidak tunggu konfirmasi (opt-in `WAIT_FOR_CONFIRMATION=true` kalau perlu)
-
-### Safety yang TETAP aktif (zero hot-path overhead)
-
-Validasi berikut dilakukan **sekali di pre-flight**, tidak menambah latensi saat mint live:
-
-- Chain ID = 1 guard
-- Bytecode existence check
-- Dangerous function denylist (`approve`, `setApprovalForAll`, dll.)
-- Fee cap (`MAX_FEE_GWEI`) — kecuali `SNIPER_BYPASS_FEE_CAP=true`
-- Burner wallet konvensi
-
-### Contoh: sniper untuk mint di waktu tertentu
-
-```env
-TRIGGER_MODE=timestamp
-TRIGGER_TIMESTAMP=1735689600          # 1 Jan 2025 00:00 UTC
-EXTRA_RPC_URLS=https://eth.llamarpc.com,https://rpc.ankr.com/eth
-STATIC_GAS_LIMIT=250000
-SNIPER_PRIORITY_GWEI=5
-WAIT_FOR_CONFIRMATION=false
-```
-
-### Contoh: sniper dengan poll fungsi `mintActive()`
+### Contoh: poll `mintActive()`
 
 ```env
 TRIGGER_MODE=poll
 TRIGGER_FN=mintActive() returns (bool)
 TRIGGER_EXPECT=true
 POLL_MS=150
-EXTRA_RPC_URLS=https://eth.llamarpc.com
 ```
 
-### Catatan keamanan untuk mode sniper
+### Contoh: scheduled mint
 
-- **WAJIB pakai burner wallet.** Mode ini broadcast tanpa konfirmasi. Kesalahan konfigurasi = kehilangan saldo wallet.
-- **Test dulu di mainnet dengan mint murah** sebelum dipakai untuk NFT bernilai tinggi.
-- **`SNIPER_BYPASS_FEE_CAP=true` adalah pintu yolo** — kalau RPC ngasih baseFee absurd (mis. bug atau attack), tx Anda bisa burn ETH banyak. Default `false` direkomendasikan.
+```env
+TRIGGER_MODE=timestamp
+TRIGGER_TIMESTAMP=1735689600
+PRESIGN_TX=true
+PRESIGN_FEE_MULTIPLIER=8
+```
+
+## Hot Path Optimization
+
+### Multi-RPC Parallel Broadcast
+
+```env
+EXTRA_RPC_URLS=https://eth.llamarpc.com,https://rpc.ankr.com/eth
+```
+
+Tx dikirim ke `RPC_URL` + semua extra paralel. `Promise.any` race untuk first-success → return hash secepat ada satu RPC accept.
+
+### Pre-Signed Tx
+
+```env
+PRESIGN_TX=true
+PRESIGN_FEE_MULTIPLIER=5
+```
+
+Sign tx **di pre-flight**. Hot path tinggal broadcast. Saving ~50-100ms karena skip nonce/baseFee fetch + sign.
+
+**Trade-off:**
+- Nonce di-FREEZE. Pastikan burner wallet tidak ada tx lain.
+- maxFee pakai multiplier headroom (default 5×) untuk survive gas spike.
+
+### Static Gas Limit
+
+```env
+STATIC_GAS_LIMIT=300000
+```
+
+Skip `estimateGas` (~50-100ms saving). Nilai 300_000 cukup untuk mayoritas mint sederhana; sesuaikan dengan target Anda (cek tx mint sebelumnya di Etherscan).
+
+### Aggressive Fee
+
+```
+maxFee = (baseFee × 3) + tip       (live-sign)
+maxFee = (baseFee × 5) + tip       (pre-sign, default headroom)
+```
+
+Tip default 3 gwei untuk inclusion cepat di blok awal.
+
+## Safety Rails (zero hot-path overhead)
+
+Semua dilakukan **sekali di pre-flight**, tidak menambah latensi hot path:
+
+| Rail | Mencegah |
+|---|---|
+| Chain ID = 1 dipaku | Tx di-broadcast ke chain salah |
+| Bytecode existence check | Alamat kontrak salah / belum deploy |
+| Dangerous function denylist | `MINT_FN=approve` typo yang bisa drain wallet |
+| Fee cap `MAX_FEE_GWEI` | RPC kasih baseFee absurd → drain wallet |
+| Extra RPC chainId validation | Salah satu RPC ke chain lain → wasted tx |
+| Format validation (private key, address, dst.) | Typo di `.env` lolos sampai runtime |
+
+## Pemecahan Masalah
+
+| Pesan error | Penyebab | Solusi |
+| --- | --- | --- |
+| `RPC bukan Ethereum Mainnet` | RPC ke L2/testnet | Ganti `RPC_URL` ke endpoint mainnet |
+| `PRIVATE_KEY format tidak valid` | Placeholder belum diganti | Isi private key burner real |
+| `Tidak ada bytecode di ...` | Alamat kontrak salah | Verifikasi di Etherscan |
+| `MINT_FN ... berpotensi berbahaya` | `MINT_FN` adalah fungsi non-mint (approve, dst.) | Pastikan benar; kalau perlu set `ALLOW_DANGEROUS_FN=true` |
+| `maxFee ... > MAX_FEE_GWEI` | Gas mainnet tinggi atau bypass tidak diaktifkan | Naikkan `MAX_FEE_GWEI` atau `SNIPER_BYPASS_FEE_CAP=true` |
+| `Saldo wallet ... mungkin kurang` | Burner wallet kurang ETH | Top up sebelum mint window |
+| `TRIGGER_MODE=... tidak valid` | Typo | Pilih `immediate`/`poll`/`timestamp`/`block` |
+| `Semua N RPC menolak tx` | Network issue atau tx invalid | Cek error message; verifikasi RPC bekerja |
+
+## Lisensi
+
+[MIT](./LICENSE)

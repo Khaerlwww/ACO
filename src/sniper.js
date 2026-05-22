@@ -5,13 +5,14 @@ import { loadTarget, buildArgs } from "./contract.js";
 import { ETHEREUM_CHAIN_ID } from "./config.js";
 
 /**
- * Sniper mode — instant mint execution dengan latensi minimum.
+ * ACO Sniper — instant mint execution dengan latensi minimum.
  *
  * Filosofi:
  *   - Semua validasi mahal dilakukan SEKALI di pre-flight, sebelum mint window
  *   - Hot path (saat mint live): nonce -> gas -> sign -> parallel broadcast
- *   - Tidak ada simulasi, prompt, atau dry-run di sini
+ *   - Tidak ada simulasi, prompt, atau dry-run
  *   - Multi-RPC parallel broadcast dengan first-success race (Promise.any)
+ *   - Fire-and-forget: return setelah RPC accept hash, tidak tunggu konfirmasi
  *
  * Mode trigger:
  *   - immediate  : fire langsung saat skrip dijalankan
@@ -23,7 +24,6 @@ import { ETHEREUM_CHAIN_ID } from "./config.js";
 /**
  * Hitung strategi fee EIP-1559: maxFee = (baseFee × multiplier) + tip,
  * dengan hard cap MAX_FEE_GWEI kecuali bypass aktif.
- * Dipakai oleh hot path & pre-sign.
  */
 function computeFees(baseFee, cfg, multiplier) {
   const tip = ethers.parseUnits(String(cfg.sniperPriorityGwei), "gwei");
@@ -47,7 +47,7 @@ function computeFees(baseFee, cfg, multiplier) {
 
 /**
  * Validasi cepat sebuah extra RPC: cek chainId == 1.
- * Dipanggil paralel di pre-flight; RPC yang chainId-nya salah dilempar.
+ * RPC yang chainId-nya salah dilempar dan diabaikan.
  */
 async function validateExtraRpc(url) {
   const p = new ethers.JsonRpcProvider(url);
@@ -61,20 +61,19 @@ async function validateExtraRpc(url) {
 }
 
 /**
- * Pre-flight: lakukan SEKALI sebelum mint window. Validasi mahal,
- * resolve ENS, build ABI, encode calldata, cache nonce & baseFee.
- * Hot path nantinya tidak menyentuh ini lagi.
+ * Pre-flight: lakukan SEKALI sebelum mint window.
+ * Validasi mahal, resolve ENS, build ABI, encode calldata,
+ * cache nonce & baseFee, optional pre-sign tx.
  */
 async function preflight(cfg) {
   const t0 = Date.now();
   const log = (msg) => console.log(`[preflight +${Date.now() - t0}ms]`, msg);
 
-  // 1. Provider utama + wallet (chainId guard di sini)
+  // Provider utama + wallet (chainId guard di sini)
   const { provider, wallet } = await buildProviderAndWallet(cfg);
   log(`wallet ${wallet.address}`);
 
-  // 2. Provider tambahan untuk parallel broadcast
-  //    Validasi paralel: setiap extra RPC dicek chainId-nya sebelum dipakai.
+  // Provider tambahan untuk parallel broadcast — chainId di-validate paralel
   const extraResults = await Promise.allSettled(
     cfg.extraRpcUrls.map((url) => validateExtraRpc(url))
   );
@@ -91,14 +90,14 @@ async function preflight(cfg) {
   const broadcastProviders = [provider, ...extraProviders];
   log(`broadcast providers: ${broadcastProviders.length} (1 primary + ${extraProviders.length} extra valid)`);
 
-  // 3. Resolve target + bytecode + ABI fragment + denylist
+  // Resolve target + bytecode + ABI fragment + denylist
   const target = await loadTarget(provider, cfg.nftContract, cfg.mintFn, {
     allowDangerousFn: cfg.allowDangerousFn,
   });
   const args = buildArgs(cfg.mintArgs, target.fragment, wallet.address);
   log(`target ${target.address} fn=${target.fragment.name}`);
 
-  // 4. Encode calldata sekali — tidak akan berubah di hot path
+  // Encode calldata sekali — tidak akan berubah di hot path
   const data = target.iface.encodeFunctionData(target.fragment, args);
   const value =
     ethers.parseEther(String(cfg.mintPriceEth)) * BigInt(cfg.quantity);
@@ -106,8 +105,7 @@ async function preflight(cfg) {
     `calldata ready (${(data.length - 2) / 2} bytes)  value=${ethers.formatEther(value)} ETH`
   );
 
-  // 5. Pre-fetch nonce, baseFee, balance paralel.
-  //    Balance untuk peringatan saja (tidak block) — sniper sengaja tidak gating saldo.
+  // Pre-fetch nonce, baseFee, balance paralel
   const [nonce, block, balance] = await Promise.all([
     provider.getTransactionCount(wallet.address, "pending"),
     provider.getBlock("latest"),
@@ -128,11 +126,11 @@ async function preflight(cfg) {
     console.warn(
       `[preflight] PERINGATAN: saldo wallet (${ethers.formatEther(balance)} ETH) ` +
         `mungkin kurang dari estimasi minimum (${ethers.formatEther(minNeeded)} ETH = gas + value). ` +
-        `Tx bisa revert "insufficient funds" saat trigger fire. Top up wallet sebelum mint window.`
+        `Tx bisa revert "insufficient funds" saat trigger fire.`
     );
   }
 
-  // 6. Build trigger detector untuk mode poll
+  // Build trigger detector untuk mode poll
   let triggerView = null;
   let triggerCallData = null;
   let triggerIface = null;
@@ -150,8 +148,7 @@ async function preflight(cfg) {
     log(`trigger poll: ${triggerView.format("full")} expect=${cfg.triggerExpect}`);
   }
 
-  // 7. (Opsional) Pre-sign tx — biggest hot path optimization.
-  //    Trade-off: nonce di-freeze, maxFee pakai multiplier headroom besar.
+  // Optional pre-sign tx — biggest hot path optimization
   let preSignedTx = null;
   if (cfg.preSignTx) {
     const { maxFee, tip, bypassWarning } = computeFees(
@@ -188,8 +185,6 @@ async function preflight(cfg) {
     target,
     data,
     value,
-    initialNonce: nonce,
-    initialBaseFee: block.baseFeePerGas,
     triggerIface,
     triggerView,
     triggerCallData,
@@ -253,7 +248,6 @@ async function waitForTrigger(ctx) {
           process.stdout.write(`[poll #${pollCount}: ${val}] `);
         }
       } catch (err) {
-        // Log full error pertama kali untuk debugging (mis. fungsi tidak ada di kontrak)
         if (!firstErrorLogged) {
           firstErrorLogged = true;
           console.warn(
@@ -273,8 +267,8 @@ async function waitForTrigger(ctx) {
 }
 
 /**
- * Fetch nonce + baseFee dengan fault tolerance: race antara primary
- * dan extra providers. First success wins. Kalau semua gagal, throw.
+ * Fetch nonce + baseFee dengan fault tolerance: race antar broadcast providers.
+ * First success wins. Kalau semua gagal, throw.
  */
 async function fetchHotPathState(broadcastProviders, walletAddress) {
   const tasks = broadcastProviders.map(async (p) => {
@@ -285,21 +279,19 @@ async function fetchHotPathState(broadcastProviders, walletAddress) {
     if (!block || block.baseFeePerGas == null) {
       throw new Error("block tidak punya baseFeePerGas");
     }
-    return { nonce, baseFee: block.baseFeePerGas, source: p };
+    return { nonce, baseFee: block.baseFeePerGas };
   });
-  // Promise.any: first fulfilled, ignore rejections
   return Promise.any(tasks);
 }
 
 /**
  * Hot path — dijalankan TEPAT saat trigger menyala.
- * Tidak ada simulasi, tidak ada prompt.
  *
  * Dua jalur:
  *   A. Pre-signed (cfg.preSignTx=true): broadcast cached signed tx langsung.
  *      Latensi minimum: ~50ms (cuma broadcast roundtrip).
  *   B. Live-sign: refresh nonce+baseFee → sign → broadcast.
- *      Latensi: ~100-150ms.
+ *      Latensi: ~80-150ms.
  */
 async function hotPath(ctx) {
   const { wallet, broadcastProviders, target, data, value, cfg, preSignedTx } = ctx;
@@ -307,22 +299,18 @@ async function hotPath(ctx) {
 
   let signedTx;
   if (preSignedTx) {
-    // JALUR A: tx sudah di-sign di pre-flight, langsung broadcast
     signedTx = preSignedTx;
     console.log(
-      `[hot +${Date.now() - t0}ms] pakai pre-signed tx (skip nonce+baseFee+sign, ~50-100ms saving)`
+      `[hot +${Date.now() - t0}ms] pakai pre-signed tx (skip nonce+baseFee+sign)`
     );
   } else {
-    // JALUR B: live-sign
-
-    // Fault-tolerant fetch nonce & baseFee — race antar broadcast providers
     let state;
     try {
       state = await fetchHotPathState(broadcastProviders, wallet.address);
     } catch (aggErr) {
       throw new Error(
         `Gagal fetch nonce/baseFee dari semua RPC. ` +
-          `Cek koneksi & EXTRA_RPC_URLS. (${aggErr.errors?.[0]?.message || aggErr.message})`
+          `(${aggErr.errors?.[0]?.message || aggErr.message})`
       );
     }
     const { nonce: freshNonce, baseFee } = state;
@@ -333,7 +321,8 @@ async function hotPath(ctx) {
     const { maxFee, tip, bypassWarning } = computeFees(baseFee, cfg, 3);
     if (bypassWarning) console.warn(`[sniper] !! ${bypassWarning}`);
 
-    const txReq = {
+    const tSign = Date.now();
+    signedTx = await wallet.signTransaction({
       to: target.address,
       data,
       value,
@@ -343,16 +332,11 @@ async function hotPath(ctx) {
       chainId: 1,
       type: 2,
       nonce: freshNonce,
-    };
-
-    const tSign = Date.now();
-    signedTx = await wallet.signTransaction(txReq);
+    });
     console.log(`[hot +${Date.now() - t0}ms] signed (${Date.now() - tSign}ms)`);
   }
 
-  // Parallel broadcast ke semua RPC dengan FIRST-SUCCESS race.
-  // Promise.any return begitu ada satu yang accept; sisanya tetap jalan
-  // di background tapi kita tidak menunggu mereka.
+  // Parallel broadcast dengan first-success race
   const t2 = Date.now();
   const sendPromises = broadcastProviders.map((p, i) =>
     p
@@ -364,7 +348,6 @@ async function hotPath(ctx) {
   try {
     accepted = await Promise.any(sendPromises);
   } catch (aggErr) {
-    // Semua reject → AggregateError. Ambil pesan dari yang pertama untuk debugging.
     const firstErr = aggErr.errors?.[0];
     const msg = firstErr?.shortMessage || firstErr?.message || "unknown";
     throw new Error(`Semua ${broadcastProviders.length} RPC menolak tx. First error: ${msg}`);
@@ -374,41 +357,13 @@ async function hotPath(ctx) {
     `[hot +${Date.now() - t0}ms] tx accepted by RPC[${accepted.idx}] in ${accepted.ms}ms: ${accepted.hash}`
   );
   console.log(`etherscan: https://etherscan.io/tx/${accepted.hash}`);
-
-  // Background: log hasil RPC lain untuk audit (tidak menunggu)
-  Promise.allSettled(sendPromises).then((all) => {
-    for (let i = 0; i < all.length; i++) {
-      const r = all[i];
-      if (i === accepted.idx) continue; // sudah dilaporkan
-      if (r.status === "fulfilled") {
-        console.log(`  RPC[${i}] also OK ${r.value.ms}ms hash=${r.value.hash}`);
-      } else {
-        const err = r.reason;
-        console.log(
-          `  RPC[${i}] FAIL ${err?.shortMessage || err?.message || "unknown"}`
-        );
-      }
-    }
-  });
-
-  if (cfg.waitForConfirmation) {
-    console.log(`[wait] menunggu konfirmasi blok...`);
-    const rc = await ctx.provider.waitForTransaction(accepted.hash, 1);
-    if (!rc) {
-      throw new Error(`Tx ${accepted.hash} tidak pernah mendapat konfirmasi`);
-    }
-    console.log(
-      `[done] status=${rc.status === 1 ? "SUKSES" : "GAGAL"} block=${rc.blockNumber} gasUsed=${rc.gasUsed}`
-    );
-    return { hash: accepted.hash, receipt: rc };
-  }
-
   console.log("[done] fire-and-forget — cek tx di Etherscan untuk konfirmasi akhir");
-  return { hash: accepted.hash, receipt: null };
+
+  return { hash: accepted.hash };
 }
 
 export async function runSniper(cfg) {
-  console.log("=== ACO SNIPER (Ethereum Mainnet) ===");
+  console.log("=== ACO Sniper (Ethereum Mainnet) ===");
   console.log(
     `mode=${cfg.triggerMode}  static-gas=${cfg.staticGasLimit}  ` +
       `pre-sign=${cfg.preSignTx}  bypass-fee-cap=${cfg.sniperBypassFeeCap}`

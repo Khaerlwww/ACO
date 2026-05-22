@@ -1,61 +1,44 @@
 #!/usr/bin/env node
 import { loadConfig } from "./config.js";
-import { runAco } from "./aco.js";
 import { runSniper } from "./sniper.js";
 
-function parseArgs(argv) {
-  const args = { mode: "dry" };
-  for (const a of argv.slice(2)) {
-    if (a === "--send") args.mode = "send";
-    else if (a === "--dry-run") args.mode = "dry";
-    else if (a === "--sniper") args.mode = "sniper";
-    else if (a === "-h" || a === "--help") args.help = true;
-  }
-  return args;
-}
-
 const HELP = `
-ACO  -  Auto Checkout / Mint NFT untuk Ethereum Mainnet (chainId = 1)
+ACO Sniper  -  Instant mint execution untuk Ethereum Mainnet (chainId = 1)
 
-MODE PENGGUNAAN:
+Penggunaan:
+  npm start
+  node src/index.js
 
-  Mode aman (review/eksplorasi):
-    node src/index.js              # dry-run: simulasi saja, tidak kirim
-    node src/index.js --dry-run    # paksa dry-run
-    node src/index.js --send       # simulasi -> y/N -> broadcast
+Konfigurasi via .env (salin dari .env.example).
 
-  Mode sniper (instant execution, tanpa simulasi/prompt):
-    node src/index.js --sniper     # trigger detection -> sign -> parallel broadcast
+Filosofi:
+  - Pre-flight (sebelum mint window): validasi chain, ABI, encode calldata,
+    cache nonce + baseFee, optional pre-sign tx.
+  - Hot path (saat trigger fire): broadcast paralel ke semua RPC, race
+    Promise.any untuk first-success. No simulation, no prompt.
 
-KONFIGURASI:
-  Salin .env.example ke .env, lalu isi sesuai kebutuhan.
+Trigger modes:
+  TRIGGER_MODE=immediate  - fire saat skrip dijalankan
+  TRIGGER_MODE=poll       - poll view fn sampai cocok TRIGGER_EXPECT
+  TRIGGER_MODE=timestamp  - tunggu Unix timestamp tertentu
+  TRIGGER_MODE=block      - tunggu block number tertentu
 
-  Untuk mode aman: cukup RPC_URL, PRIVATE_KEY, NFT_CONTRACT, MINT_FN, MINT_ARGS.
-
-  Untuk mode sniper, tambahkan minimal:
-    TRIGGER_MODE=immediate|poll|timestamp|block
-    EXTRA_RPC_URLS=...   (opsional, untuk parallel broadcast)
-    STATIC_GAS_LIMIT=300000
-    SNIPER_PRIORITY_GWEI=3
-
-KESELAMATAN:
-  - Skrip menolak chain != 1, alamat tanpa bytecode, MINT_FN berbahaya.
-  - SELALU gunakan BURNER WALLET di PRIVATE_KEY.
+Keselamatan minimum (zero hot-path overhead):
+  - Chain ID = 1 dipaku
+  - Bytecode check di pre-flight
+  - Dangerous function denylist (approve, transfer, burn, dst.)
+  - Fee cap MAX_FEE_GWEI (override via SNIPER_BYPASS_FEE_CAP=true)
+  - WAJIB pakai BURNER WALLET di PRIVATE_KEY
 `;
 
 (async () => {
-  const args = parseArgs(process.argv);
-  if (args.help) {
+  if (process.argv.includes("-h") || process.argv.includes("--help")) {
     console.log(HELP);
     return;
   }
   try {
     const cfg = loadConfig();
-    if (args.mode === "sniper") {
-      await runSniper(cfg);
-    } else {
-      await runAco(cfg, { send: args.mode === "send" });
-    }
+    await runSniper(cfg);
   } catch (err) {
     console.error("\nDIBATALKAN:", err.shortMessage || err.message);
     process.exit(1);
