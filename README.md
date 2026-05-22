@@ -249,3 +249,93 @@ Repo ini menyertakan `package-lock.json` agar `npm install` selalu menghasilkan 
 ## Lisensi
 
 [MIT](./LICENSE)
+
+
+
+---
+
+## Mode Sniper (Instant Execution)
+
+Untuk skenario di mana Anda butuh **eksekusi mint secepat mungkin** saat _mint window_ live dibuka — tanpa simulasi, tanpa prompt, tanpa _double approval_:
+
+```bash
+npm run sniper
+```
+
+### Filosofi sniper mode
+
+- **Pre-flight (sekali, sebelum mint window):** validasi chain, resolve ENS, verifikasi bytecode, _denylist check_, encode calldata, cache nonce & baseFee.
+- **Hot path (saat mint live):** refresh nonce → refresh baseFee → sign → broadcast paralel ke semua RPC.
+- **Tidak ada simulasi, prompt, atau dry-run di hot path.**
+
+Latensi tipikal hot path: ~50-200ms tergantung RPC + jaringan.
+
+### Mode trigger
+
+| `TRIGGER_MODE` | Perilaku |
+| --- | --- |
+| `immediate` | Fire langsung saat skrip dijalankan |
+| `poll` | Poll _view function_, fire saat return value cocok `TRIGGER_EXPECT` |
+| `timestamp` | Tunggu sampai `TRIGGER_TIMESTAMP` (Unix detik), lalu fire |
+| `block` | Tunggu sampai `blockNumber >= TRIGGER_BLOCK`, lalu fire |
+
+### Konfigurasi sniper
+
+| Variabel | Default | Deskripsi |
+| --- | --- | --- |
+| `TRIGGER_MODE` | `immediate` | Salah satu dari di atas |
+| `TRIGGER_FN` | `mintActive() returns (bool)` | View fn untuk mode `poll` |
+| `TRIGGER_EXPECT` | `true` | Nilai return yang men-trigger fire |
+| `POLL_MS` | `200` | Jeda antar poll dalam milidetik |
+| `TRIGGER_TIMESTAMP` | `0` | Unix epoch detik untuk mode `timestamp` |
+| `TRIGGER_BLOCK` | `0` | Block number untuk mode `block` |
+| `EXTRA_RPC_URLS` | _(kosong)_ | RPC tambahan untuk parallel broadcast (comma-separated) |
+| `STATIC_GAS_LIMIT` | `300000` | Gas limit statik (skip `estimateGas`) |
+| `SNIPER_PRIORITY_GWEI` | `3` | Priority fee untuk inclusion cepat |
+| `SNIPER_BYPASS_FEE_CAP` | `false` | Bypass `MAX_FEE_GWEI` cap (HATI-HATI) |
+| `WAIT_FOR_CONFIRMATION` | `false` | `true` = tunggu 1 konfirmasi, `false` = fire-and-forget |
+
+### Optimasi yang aktif
+
+- ⚡ **Multi-RPC parallel broadcast** — broadcast ke `RPC_URL` + semua `EXTRA_RPC_URLS` sekaligus, race siapa duluan accept
+- ⚡ **Pre-built calldata** — encoded sekali di pre-flight, dipakai ulang
+- ⚡ **Static gas limit** — skip `estimateGas` (~50-100ms saving)
+- ⚡ **Aggressive fee** — `maxFee = 3 × baseFee + tip` untuk masuk blok awal
+- ⚡ **Fire-and-forget** — return setelah RPC accept, tidak tunggu konfirmasi (opt-in `WAIT_FOR_CONFIRMATION=true` kalau perlu)
+
+### Safety yang TETAP aktif (zero hot-path overhead)
+
+Validasi berikut dilakukan **sekali di pre-flight**, tidak menambah latensi saat mint live:
+
+- Chain ID = 1 guard
+- Bytecode existence check
+- Dangerous function denylist (`approve`, `setApprovalForAll`, dll.)
+- Fee cap (`MAX_FEE_GWEI`) — kecuali `SNIPER_BYPASS_FEE_CAP=true`
+- Burner wallet konvensi
+
+### Contoh: sniper untuk mint di waktu tertentu
+
+```env
+TRIGGER_MODE=timestamp
+TRIGGER_TIMESTAMP=1735689600          # 1 Jan 2025 00:00 UTC
+EXTRA_RPC_URLS=https://eth.llamarpc.com,https://rpc.ankr.com/eth
+STATIC_GAS_LIMIT=250000
+SNIPER_PRIORITY_GWEI=5
+WAIT_FOR_CONFIRMATION=false
+```
+
+### Contoh: sniper dengan poll fungsi `mintActive()`
+
+```env
+TRIGGER_MODE=poll
+TRIGGER_FN=mintActive() returns (bool)
+TRIGGER_EXPECT=true
+POLL_MS=150
+EXTRA_RPC_URLS=https://eth.llamarpc.com
+```
+
+### Catatan keamanan untuk mode sniper
+
+- **WAJIB pakai burner wallet.** Mode ini broadcast tanpa konfirmasi. Kesalahan konfigurasi = kehilangan saldo wallet.
+- **Test dulu di mainnet dengan mint murah** sebelum dipakai untuk NFT bernilai tinggi.
+- **`SNIPER_BYPASS_FEE_CAP=true` adalah pintu yolo** — kalau RPC ngasih baseFee absurd (mis. bug atau attack), tx Anda bisa burn ETH banyak. Default `false` direkomendasikan.

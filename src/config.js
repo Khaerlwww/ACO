@@ -76,5 +76,38 @@ export function loadConfig() {
     // Hardening: izinkan MINT_FN yang berpotensi berbahaya (approve,
     // setApprovalForAll, dll). Default false; kalau Anda yakin, set true.
     allowDangerousFn: bool("ALLOW_DANGEROUS_FN", false),
+
+    // === SNIPER MODE ===
+    // Trigger detection: immediate | poll | timestamp | block
+    triggerMode: (process.env.TRIGGER_MODE ?? "immediate").trim().toLowerCase(),
+
+    // Untuk TRIGGER_MODE=poll
+    triggerFn: process.env.TRIGGER_FN?.trim() || "",
+    triggerExpect: process.env.TRIGGER_EXPECT?.trim() ?? "true",
+    pollMs: num("POLL_MS", 200, { min: 50, integer: true }),
+
+    // Untuk TRIGGER_MODE=timestamp (Unix epoch detik)
+    triggerTimestamp: num("TRIGGER_TIMESTAMP", 0, { min: 0, integer: true }),
+
+    // Untuk TRIGGER_MODE=block
+    triggerBlock: num("TRIGGER_BLOCK", 0, { min: 0, integer: true }),
+
+    // Multi-RPC parallel broadcast — comma-separated URL tambahan
+    extraRpcUrls: (process.env.EXTRA_RPC_URLS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+
+    // Static gas limit untuk skip estimateGas (~50-100ms saving)
+    staticGasLimit: num("STATIC_GAS_LIMIT", 300000, { min: 21000, integer: true }),
+
+    // Aggressive priority fee untuk inclusion cepat di blok awal
+    sniperPriorityGwei: num("SNIPER_PRIORITY_GWEI", 3, { min: 0 }),
+
+    // Bypass MAX_FEE_GWEI cap kalau jaringan kongesti (HATI-HATI)
+    sniperBypassFeeCap: bool("SNIPER_BYPASS_FEE_CAP", false),
+
+    // Tunggu konfirmasi setelah broadcast (false = fire-and-forget, lebih cepat)
+    waitForConfirmation: bool("WAIT_FOR_CONFIRMATION", false),
   };
 }
