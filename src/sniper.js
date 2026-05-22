@@ -21,6 +21,31 @@ import { ETHEREUM_CHAIN_ID } from "./config.js";
  */
 
 /**
+ * Hitung strategi fee EIP-1559: maxFee = (baseFee × multiplier) + tip,
+ * dengan hard cap MAX_FEE_GWEI kecuali bypass aktif.
+ * Dipakai oleh hot path & pre-sign.
+ */
+function computeFees(baseFee, cfg, multiplier) {
+  const tip = ethers.parseUnits(String(cfg.sniperPriorityGwei), "gwei");
+  const maxFeeCap = ethers.parseUnits(String(cfg.maxFeeGwei), "gwei");
+  let maxFee = baseFee * BigInt(multiplier) + tip;
+  let bypassWarning = null;
+  if (maxFee > maxFeeCap) {
+    if (!cfg.sniperBypassFeeCap) {
+      throw new Error(
+        `maxFee ${ethers.formatUnits(maxFee, "gwei")}gw > MAX_FEE_GWEI=${cfg.maxFeeGwei}. ` +
+          `Set SNIPER_BYPASS_FEE_CAP=true kalau Anda mau yolo (HATI-HATI).`
+      );
+    }
+    bypassWarning =
+      `BYPASS aktif: maxFee ${ethers.formatUnits(maxFee, "gwei")}gw ` +
+      `melebihi cap ${cfg.maxFeeGwei}gw. ` +
+      `Estimasi biaya: ${ethers.formatEther(BigInt(cfg.staticGasLimit) * maxFee)} ETH`;
+  }
+  return { maxFee, tip, bypassWarning };
+}
+
+/**
  * Validasi cepat sebuah extra RPC: cek chainId == 1.
  * Dipanggil paralel di pre-flight; RPC yang chainId-nya salah dilempar.
  */
@@ -125,6 +150,37 @@ async function preflight(cfg) {
     log(`trigger poll: ${triggerView.format("full")} expect=${cfg.triggerExpect}`);
   }
 
+  // 7. (Opsional) Pre-sign tx — biggest hot path optimization.
+  //    Trade-off: nonce di-freeze, maxFee pakai multiplier headroom besar.
+  let preSignedTx = null;
+  if (cfg.preSignTx) {
+    const { maxFee, tip, bypassWarning } = computeFees(
+      block.baseFeePerGas,
+      cfg,
+      cfg.preSignFeeMultiplier
+    );
+    if (bypassWarning) console.warn(`[preflight] !! ${bypassWarning}`);
+
+    const tSign = Date.now();
+    preSignedTx = await wallet.signTransaction({
+      to: target.address,
+      data,
+      value,
+      gasLimit: BigInt(cfg.staticGasLimit),
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: tip,
+      chainId: 1,
+      type: 2,
+      nonce,
+    });
+    log(
+      `pre-signed tx (${Date.now() - tSign}ms)  ` +
+        `maxFee=${ethers.formatUnits(maxFee, "gwei")}gw  ` +
+        `tip=${ethers.formatUnits(tip, "gwei")}gw  ` +
+        `nonce=${nonce} (FROZEN)`
+    );
+  }
+
   return {
     wallet,
     provider,
@@ -137,6 +193,7 @@ async function preflight(cfg) {
     triggerIface,
     triggerView,
     triggerCallData,
+    preSignedTx,
     cfg,
   };
 }
@@ -236,62 +293,62 @@ async function fetchHotPathState(broadcastProviders, walletAddress) {
 
 /**
  * Hot path — dijalankan TEPAT saat trigger menyala.
- * Tidak ada simulasi, tidak ada prompt. Hanya: nonce → gas → sign → broadcast.
+ * Tidak ada simulasi, tidak ada prompt.
+ *
+ * Dua jalur:
+ *   A. Pre-signed (cfg.preSignTx=true): broadcast cached signed tx langsung.
+ *      Latensi minimum: ~50ms (cuma broadcast roundtrip).
+ *   B. Live-sign: refresh nonce+baseFee → sign → broadcast.
+ *      Latensi: ~100-150ms.
  */
 async function hotPath(ctx) {
-  const { wallet, broadcastProviders, target, data, value, cfg } = ctx;
+  const { wallet, broadcastProviders, target, data, value, cfg, preSignedTx } = ctx;
   const t0 = Date.now();
 
-  // Fault-tolerant fetch nonce & baseFee — race antar broadcast providers
-  let state;
-  try {
-    state = await fetchHotPathState(broadcastProviders, wallet.address);
-  } catch (aggErr) {
-    throw new Error(
-      `Gagal fetch nonce/baseFee dari semua RPC. ` +
-        `Cek koneksi & EXTRA_RPC_URLS. (${aggErr.errors?.[0]?.message || aggErr.message})`
+  let signedTx;
+  if (preSignedTx) {
+    // JALUR A: tx sudah di-sign di pre-flight, langsung broadcast
+    signedTx = preSignedTx;
+    console.log(
+      `[hot +${Date.now() - t0}ms] pakai pre-signed tx (skip nonce+baseFee+sign, ~50-100ms saving)`
     );
-  }
-  const { nonce: freshNonce, baseFee } = state;
-  console.log(
-    `[hot +${Date.now() - t0}ms] nonce=${freshNonce} baseFee=${ethers.formatUnits(baseFee, "gwei")}gw`
-  );
+  } else {
+    // JALUR B: live-sign
 
-  // Aggressive fee: 3x baseFee + tip, dengan hard cap (kecuali bypass)
-  const tip = ethers.parseUnits(String(cfg.sniperPriorityGwei), "gwei");
-  const maxFeeCap = ethers.parseUnits(String(cfg.maxFeeGwei), "gwei");
-  let maxFee = baseFee * 3n + tip;
-  if (maxFee > maxFeeCap) {
-    if (!cfg.sniperBypassFeeCap) {
+    // Fault-tolerant fetch nonce & baseFee — race antar broadcast providers
+    let state;
+    try {
+      state = await fetchHotPathState(broadcastProviders, wallet.address);
+    } catch (aggErr) {
       throw new Error(
-        `[sniper] maxFee ${ethers.formatUnits(maxFee, "gwei")}gw > MAX_FEE_GWEI=${cfg.maxFeeGwei}. ` +
-          `Set SNIPER_BYPASS_FEE_CAP=true kalau Anda mau yolo (HATI-HATI).`
+        `Gagal fetch nonce/baseFee dari semua RPC. ` +
+          `Cek koneksi & EXTRA_RPC_URLS. (${aggErr.errors?.[0]?.message || aggErr.message})`
       );
     }
-    console.warn(
-      `[sniper] !! BYPASS aktif: maxFee ${ethers.formatUnits(maxFee, "gwei")}gw ` +
-        `melebihi cap ${cfg.maxFeeGwei}gw, dipakai apa adanya. ` +
-        `Estimasi biaya: ${ethers.formatEther(BigInt(cfg.staticGasLimit) * maxFee)} ETH`
+    const { nonce: freshNonce, baseFee } = state;
+    console.log(
+      `[hot +${Date.now() - t0}ms] nonce=${freshNonce} baseFee=${ethers.formatUnits(baseFee, "gwei")}gw`
     );
+
+    const { maxFee, tip, bypassWarning } = computeFees(baseFee, cfg, 3);
+    if (bypassWarning) console.warn(`[sniper] !! ${bypassWarning}`);
+
+    const txReq = {
+      to: target.address,
+      data,
+      value,
+      gasLimit: BigInt(cfg.staticGasLimit),
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: tip,
+      chainId: 1,
+      type: 2,
+      nonce: freshNonce,
+    };
+
+    const tSign = Date.now();
+    signedTx = await wallet.signTransaction(txReq);
+    console.log(`[hot +${Date.now() - t0}ms] signed (${Date.now() - tSign}ms)`);
   }
-
-  const gasLimit = BigInt(cfg.staticGasLimit);
-
-  const txReq = {
-    to: target.address,
-    data,
-    value,
-    gasLimit,
-    maxFeePerGas: maxFee,
-    maxPriorityFeePerGas: tip,
-    chainId: 1,
-    type: 2,
-    nonce: freshNonce,
-  };
-
-  const t1 = Date.now();
-  const signedTx = await wallet.signTransaction(txReq);
-  console.log(`[hot +${Date.now() - t0}ms] signed (${Date.now() - t1}ms)`);
 
   // Parallel broadcast ke semua RPC dengan FIRST-SUCCESS race.
   // Promise.any return begitu ada satu yang accept; sisanya tetap jalan
@@ -336,7 +393,6 @@ async function hotPath(ctx) {
 
   if (cfg.waitForConfirmation) {
     console.log(`[wait] menunggu konfirmasi blok...`);
-    // Pakai broadcastProviders[0] (primary) atau bisa juga state.source kalau ada
     const rc = await ctx.provider.waitForTransaction(accepted.hash, 1);
     if (!rc) {
       throw new Error(`Tx ${accepted.hash} tidak pernah mendapat konfirmasi`);
@@ -354,7 +410,8 @@ async function hotPath(ctx) {
 export async function runSniper(cfg) {
   console.log("=== ACO SNIPER (Ethereum Mainnet) ===");
   console.log(
-    `mode=${cfg.triggerMode}  static-gas=${cfg.staticGasLimit}  bypass-fee-cap=${cfg.sniperBypassFeeCap}`
+    `mode=${cfg.triggerMode}  static-gas=${cfg.staticGasLimit}  ` +
+      `pre-sign=${cfg.preSignTx}  bypass-fee-cap=${cfg.sniperBypassFeeCap}`
   );
 
   const ctx = await preflight(cfg);

@@ -137,5 +137,16 @@ export function loadConfig() {
 
     // Tunggu konfirmasi setelah broadcast (false = fire-and-forget, lebih cepat)
     waitForConfirmation: bool("WAIT_FOR_CONFIRMATION", false),
+
+    // Pre-sign tx di pre-flight untuk cut ~50-100ms dari hot path.
+    // Hot path tinggal broadcast cached signed tx — tidak fetch nonce/baseFee, tidak sign ulang.
+    // Trade-off: nonce di-freeze (jangan ada tx lain di wallet ini), maxFee pakai
+    // multiplier headroom besar (PRESIGN_FEE_MULTIPLIER) untuk survive gas spike.
+    preSignTx: bool("PRESIGN_TX", false),
+
+    // Multiplier baseFee untuk pre-signed maxFee. Default 5x cukup untuk survive
+    // ~14 blok kongesti penuh (1.125^14 ≈ 5.04). Naikkan kalau mint window jauh
+    // di masa depan & gas bisa volatile, tapi maxFee tetap di-cap MAX_FEE_GWEI.
+    preSignFeeMultiplier: num("PRESIGN_FEE_MULTIPLIER", 5, { min: 2, integer: true }),
   };
 }
