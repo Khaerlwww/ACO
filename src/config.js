@@ -6,6 +6,15 @@ import "dotenv/config";
  */
 export const ETHEREUM_CHAIN_ID = 1n;
 
+const VALID_TRIGGER_MODES = new Set([
+  "immediate",
+  "poll",
+  "timestamp",
+  "block",
+]);
+
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
 function req(name) {
   const v = process.env[name];
   if (!v || v.trim() === "") throw new Error(`Variabel .env wajib hilang: ${name}`);
@@ -30,6 +39,24 @@ function bool(name, def) {
   const v = process.env[name];
   if (v === undefined || v === "") return def;
   return ["1", "true", "yes", "y"].includes(v.trim().toLowerCase());
+}
+
+function enumOf(name, validSet, def) {
+  const v = (process.env[name] ?? def).trim().toLowerCase();
+  if (!validSet.has(v)) {
+    throw new Error(
+      `${name}=${v} tidak valid. Pilih salah satu: ${[...validSet].join(", ")}`
+    );
+  }
+  return v;
+}
+
+function addressOpt(name, def) {
+  const v = process.env[name]?.trim() || def;
+  if (!ADDRESS_RE.test(v)) {
+    throw new Error(`${name} bukan alamat hex 20-byte yang valid: ${v}`);
+  }
+  return v;
 }
 
 export function loadConfig() {
@@ -62,9 +89,10 @@ export function loadConfig() {
 
     // Rantai fallback estimasi biaya
     useChainlinkFallback: bool("USE_CHAINLINK_FALLBACK", true),
-    chainlinkFastGasFeed:
-      process.env.CHAINLINK_FAST_GAS_FEED?.trim() ||
-      "0x169E633A2D1E6c10dD91238Ba11c4A708dfEF37C",
+    chainlinkFastGasFeed: addressOpt(
+      "CHAINLINK_FAST_GAS_FEED",
+      "0x169E633A2D1E6c10dD91238Ba11c4A708dfEF37C"
+    ),
 
     // MEV protection (informasi saja; aktif jika RPC_URL = endpoint Flashbots Protect)
     usingFlashbotsProtect: bool("USING_FLASHBOTS_PROTECT", false),
@@ -79,7 +107,7 @@ export function loadConfig() {
 
     // === SNIPER MODE ===
     // Trigger detection: immediate | poll | timestamp | block
-    triggerMode: (process.env.TRIGGER_MODE ?? "immediate").trim().toLowerCase(),
+    triggerMode: enumOf("TRIGGER_MODE", VALID_TRIGGER_MODES, "immediate"),
 
     // Untuk TRIGGER_MODE=poll
     triggerFn: process.env.TRIGGER_FN?.trim() || "",

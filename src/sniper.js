@@ -2,6 +2,7 @@ import { ethers } from "ethers";
 
 import { buildProviderAndWallet } from "./provider.js";
 import { loadTarget, buildArgs } from "./contract.js";
+import { ETHEREUM_CHAIN_ID } from "./config.js";
 
 /**
  * Sniper mode — instant mint execution dengan latensi minimum.
@@ -10,7 +11,7 @@ import { loadTarget, buildArgs } from "./contract.js";
  *   - Semua validasi mahal dilakukan SEKALI di pre-flight, sebelum mint window
  *   - Hot path (saat mint live): nonce -> gas -> sign -> parallel broadcast
  *   - Tidak ada simulasi, prompt, atau dry-run di sini
- *   - Multi-RPC parallel broadcast untuk inclusion rate maksimum
+ *   - Multi-RPC parallel broadcast dengan first-success race (Promise.any)
  *
  * Mode trigger:
  *   - immediate  : fire langsung saat skrip dijalankan
@@ -18,6 +19,21 @@ import { loadTarget, buildArgs } from "./contract.js";
  *   - timestamp  : tunggu sampai Unix timestamp tertentu, lalu fire
  *   - block      : tunggu sampai blockNumber >= TRIGGER_BLOCK, lalu fire
  */
+
+/**
+ * Validasi cepat sebuah extra RPC: cek chainId == 1.
+ * Dipanggil paralel di pre-flight; RPC yang chainId-nya salah dilempar.
+ */
+async function validateExtraRpc(url) {
+  const p = new ethers.JsonRpcProvider(url);
+  const net = await p.getNetwork();
+  if (net.chainId !== ETHEREUM_CHAIN_ID) {
+    throw new Error(
+      `RPC ${url} bukan mainnet (chainId=${net.chainId.toString()}); diabaikan`
+    );
+  }
+  return p;
+}
 
 /**
  * Pre-flight: lakukan SEKALI sebelum mint window. Validasi mahal,
@@ -32,19 +48,23 @@ async function preflight(cfg) {
   const { provider, wallet } = await buildProviderAndWallet(cfg);
   log(`wallet ${wallet.address}`);
 
-  // 2. Provider tambahan untuk parallel broadcast (kalau ada)
-  const extraProviders = cfg.extraRpcUrls
-    .map((url) => {
-      try {
-        return new ethers.JsonRpcProvider(url);
-      } catch (err) {
-        console.warn(`[preflight] skip RPC ${url}: ${err.message}`);
-        return null;
-      }
-    })
-    .filter(Boolean);
+  // 2. Provider tambahan untuk parallel broadcast
+  //    Validasi paralel: setiap extra RPC dicek chainId-nya sebelum dipakai.
+  const extraResults = await Promise.allSettled(
+    cfg.extraRpcUrls.map((url) => validateExtraRpc(url))
+  );
+  const extraProviders = [];
+  for (let i = 0; i < extraResults.length; i++) {
+    const r = extraResults[i];
+    const url = cfg.extraRpcUrls[i];
+    if (r.status === "fulfilled") {
+      extraProviders.push(r.value);
+    } else {
+      console.warn(`[preflight] skip extra RPC ${url}: ${r.reason?.message || r.reason}`);
+    }
+  }
   const broadcastProviders = [provider, ...extraProviders];
-  log(`broadcast providers: ${broadcastProviders.length}`);
+  log(`broadcast providers: ${broadcastProviders.length} (1 primary + ${extraProviders.length} extra valid)`);
 
   // 3. Resolve target + bytecode + ABI fragment + denylist
   const target = await loadTarget(provider, cfg.nftContract, cfg.mintFn, {
@@ -61,17 +81,31 @@ async function preflight(cfg) {
     `calldata ready (${(data.length - 2) / 2} bytes)  value=${ethers.formatEther(value)} ETH`
   );
 
-  // 5. Pre-fetch nonce & baseFee paralel
-  const [nonce, block] = await Promise.all([
+  // 5. Pre-fetch nonce, baseFee, balance paralel.
+  //    Balance untuk peringatan saja (tidak block) — sniper sengaja tidak gating saldo.
+  const [nonce, block, balance] = await Promise.all([
     provider.getTransactionCount(wallet.address, "pending"),
     provider.getBlock("latest"),
+    provider.getBalance(wallet.address),
   ]);
   if (!block || block.baseFeePerGas == null) {
     throw new Error("Block terbaru tidak punya baseFeePerGas. Apakah benar Ethereum?");
   }
   log(
-    `nonce=${nonce}  baseFee=${ethers.formatUnits(block.baseFeePerGas, "gwei")} gwei`
+    `nonce=${nonce}  baseFee=${ethers.formatUnits(block.baseFeePerGas, "gwei")} gwei  ` +
+      `balance=${ethers.formatEther(balance)} ETH`
   );
+
+  // Estimasi kasar biaya minimum (gas + value) untuk peringatan saldo
+  const minMaxFee = block.baseFeePerGas * 3n + ethers.parseUnits(String(cfg.sniperPriorityGwei), "gwei");
+  const minNeeded = BigInt(cfg.staticGasLimit) * minMaxFee + value;
+  if (balance < minNeeded) {
+    console.warn(
+      `[preflight] PERINGATAN: saldo wallet (${ethers.formatEther(balance)} ETH) ` +
+        `mungkin kurang dari estimasi minimum (${ethers.formatEther(minNeeded)} ETH = gas + value). ` +
+        `Tx bisa revert "insufficient funds" saat trigger fire. Top up wallet sebelum mint window.`
+    );
+  }
 
   // 6. Build trigger detector untuk mode poll
   let triggerView = null;
@@ -147,6 +181,7 @@ async function waitForTrigger(ctx) {
   if (cfg.triggerMode === "poll") {
     const expectStr = String(cfg.triggerExpect).toLowerCase();
     let pollCount = 0;
+    let firstErrorLogged = false;
     while (true) {
       pollCount++;
       try {
@@ -161,6 +196,14 @@ async function waitForTrigger(ctx) {
           process.stdout.write(`[poll #${pollCount}: ${val}] `);
         }
       } catch (err) {
+        // Log full error pertama kali untuk debugging (mis. fungsi tidak ada di kontrak)
+        if (!firstErrorLogged) {
+          firstErrorLogged = true;
+          console.warn(
+            `\n[trigger] poll error (akan terus retry): ${err.shortMessage || err.message}\n` +
+              `         pastikan TRIGGER_FN cocok dengan ABI kontrak target.`
+          );
+        }
         if (pollCount % 10 === 0) {
           process.stdout.write(`[poll #${pollCount}: err] `);
         }
@@ -173,19 +216,43 @@ async function waitForTrigger(ctx) {
 }
 
 /**
+ * Fetch nonce + baseFee dengan fault tolerance: race antara primary
+ * dan extra providers. First success wins. Kalau semua gagal, throw.
+ */
+async function fetchHotPathState(broadcastProviders, walletAddress) {
+  const tasks = broadcastProviders.map(async (p) => {
+    const [nonce, block] = await Promise.all([
+      p.getTransactionCount(walletAddress, "pending"),
+      p.getBlock("latest"),
+    ]);
+    if (!block || block.baseFeePerGas == null) {
+      throw new Error("block tidak punya baseFeePerGas");
+    }
+    return { nonce, baseFee: block.baseFeePerGas, source: p };
+  });
+  // Promise.any: first fulfilled, ignore rejections
+  return Promise.any(tasks);
+}
+
+/**
  * Hot path — dijalankan TEPAT saat trigger menyala.
  * Tidak ada simulasi, tidak ada prompt. Hanya: nonce → gas → sign → broadcast.
  */
 async function hotPath(ctx) {
-  const { wallet, provider, broadcastProviders, target, data, value, cfg } = ctx;
+  const { wallet, broadcastProviders, target, data, value, cfg } = ctx;
   const t0 = Date.now();
 
-  // Refresh nonce & baseFee paralel
-  const [freshNonce, latestBlock] = await Promise.all([
-    provider.getTransactionCount(wallet.address, "pending"),
-    provider.getBlock("latest"),
-  ]);
-  const baseFee = latestBlock.baseFeePerGas;
+  // Fault-tolerant fetch nonce & baseFee — race antar broadcast providers
+  let state;
+  try {
+    state = await fetchHotPathState(broadcastProviders, wallet.address);
+  } catch (aggErr) {
+    throw new Error(
+      `Gagal fetch nonce/baseFee dari semua RPC. ` +
+        `Cek koneksi & EXTRA_RPC_URLS. (${aggErr.errors?.[0]?.message || aggErr.message})`
+    );
+  }
+  const { nonce: freshNonce, baseFee } = state;
   console.log(
     `[hot +${Date.now() - t0}ms] nonce=${freshNonce} baseFee=${ethers.formatUnits(baseFee, "gwei")}gw`
   );
@@ -201,7 +268,11 @@ async function hotPath(ctx) {
           `Set SNIPER_BYPASS_FEE_CAP=true kalau Anda mau yolo (HATI-HATI).`
       );
     }
-    console.warn(`[sniper] maxFee melebihi cap, dipakai apa adanya (BYPASS aktif)`);
+    console.warn(
+      `[sniper] !! BYPASS aktif: maxFee ${ethers.formatUnits(maxFee, "gwei")}gw ` +
+        `melebihi cap ${cfg.maxFeeGwei}gw, dipakai apa adanya. ` +
+        `Estimasi biaya: ${ethers.formatEther(BigInt(cfg.staticGasLimit) * maxFee)} ETH`
+    );
   }
 
   const gasLimit = BigInt(cfg.staticGasLimit);
@@ -222,40 +293,51 @@ async function hotPath(ctx) {
   const signedTx = await wallet.signTransaction(txReq);
   console.log(`[hot +${Date.now() - t0}ms] signed (${Date.now() - t1}ms)`);
 
-  // Parallel broadcast ke semua RPC
+  // Parallel broadcast ke semua RPC dengan FIRST-SUCCESS race.
+  // Promise.any return begitu ada satu yang accept; sisanya tetap jalan
+  // di background tapi kita tidak menunggu mereka.
   const t2 = Date.now();
-  const sends = broadcastProviders.map((p, i) =>
+  const sendPromises = broadcastProviders.map((p, i) =>
     p
       .broadcastTransaction(signedTx)
-      .then((res) => ({ ok: true, idx: i, hash: res.hash, ms: Date.now() - t2 }))
-      .catch((err) => ({
-        ok: false,
-        idx: i,
-        error: err.shortMessage || err.message,
-        ms: Date.now() - t2,
-      }))
+      .then((res) => ({ idx: i, hash: res.hash, ms: Date.now() - t2 }))
   );
-  const results = await Promise.all(sends);
 
-  console.log(`[hot +${Date.now() - t0}ms] broadcast results:`);
-  for (const r of results) {
-    if (r.ok) {
-      console.log(`  RPC[${r.idx}] OK   ${r.ms}ms  hash=${r.hash}`);
-    } else {
-      console.log(`  RPC[${r.idx}] FAIL ${r.ms}ms  ${r.error}`);
-    }
+  let accepted;
+  try {
+    accepted = await Promise.any(sendPromises);
+  } catch (aggErr) {
+    // Semua reject → AggregateError. Ambil pesan dari yang pertama untuk debugging.
+    const firstErr = aggErr.errors?.[0];
+    const msg = firstErr?.shortMessage || firstErr?.message || "unknown";
+    throw new Error(`Semua ${broadcastProviders.length} RPC menolak tx. First error: ${msg}`);
   }
 
-  const accepted = results.find((r) => r.ok);
-  if (!accepted) {
-    throw new Error("Semua RPC menolak tx. Cek pesan error di atas.");
-  }
-  console.log(`[hot +${Date.now() - t0}ms] tx accepted: ${accepted.hash}`);
+  console.log(
+    `[hot +${Date.now() - t0}ms] tx accepted by RPC[${accepted.idx}] in ${accepted.ms}ms: ${accepted.hash}`
+  );
   console.log(`etherscan: https://etherscan.io/tx/${accepted.hash}`);
+
+  // Background: log hasil RPC lain untuk audit (tidak menunggu)
+  Promise.allSettled(sendPromises).then((all) => {
+    for (let i = 0; i < all.length; i++) {
+      const r = all[i];
+      if (i === accepted.idx) continue; // sudah dilaporkan
+      if (r.status === "fulfilled") {
+        console.log(`  RPC[${i}] also OK ${r.value.ms}ms hash=${r.value.hash}`);
+      } else {
+        const err = r.reason;
+        console.log(
+          `  RPC[${i}] FAIL ${err?.shortMessage || err?.message || "unknown"}`
+        );
+      }
+    }
+  });
 
   if (cfg.waitForConfirmation) {
     console.log(`[wait] menunggu konfirmasi blok...`);
-    const rc = await provider.waitForTransaction(accepted.hash, 1);
+    // Pakai broadcastProviders[0] (primary) atau bisa juga state.source kalau ada
+    const rc = await ctx.provider.waitForTransaction(accepted.hash, 1);
     if (!rc) {
       throw new Error(`Tx ${accepted.hash} tidak pernah mendapat konfirmasi`);
     }
