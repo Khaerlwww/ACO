@@ -180,6 +180,56 @@ Transaksi yang dikirim lewat endpoint ini **tidak masuk mempool publik**, sehing
 - **Cek saldo otomatis.** Skrip menolak mengirim kalau saldo wallet < estimasi total biaya.
 - **Tidak ada retry untuk revert nyata.** Hanya error transien yang di-retry.
 
+## Hardening Production
+
+Untuk mengurangi risiko eksekusi tidak sengaja & penyalahgunaan konfigurasi:
+
+### 1. Gerbang ganda untuk broadcast
+
+Untuk mengirim transaksi nyata, **dua hal wajib aktif bersamaan**:
+
+```bash
+# Di .env
+LIVE_MINT_APPROVED=yes
+
+# Di terminal
+npm run send
+```
+
+Tanpa salah satunya, broadcast diblokir. Ini mencegah skenario seperti:
+- Anda sengaja jalankan `npm run send` saat sebenarnya ingin `npm run dry`.
+- Otomatisasi/CI yang tidak sengaja memicu broadcast.
+
+### 2. Denylist fungsi berbahaya
+
+Skrip menolak `MINT_FN` yang nama fungsinya termasuk:
+
+| Kategori | Contoh fungsi |
+| --- | --- |
+| Persetujuan token | `approve`, `setApprovalForAll`, `permit`, `increaseAllowance` |
+| Transfer keluar | `transfer`, `transferFrom`, `safeTransferFrom` |
+| Penghancuran | `burn`, `burnFrom` |
+| Penarikan dana | `withdraw`, `withdrawAll`, `withdrawTo` |
+| Kontrol kontrak | `transferOwnership`, `renounceOwnership`, `delegate` |
+| Eksekusi arbitrer | `execute`, `execTransaction`, `multicall` |
+
+Ini mencegah skenario di mana attacker mengarahkan Anda untuk set `MINT_FN=approve(address,uint256)` dengan spender attacker.
+
+Kalau Anda yakin butuh fungsi ini, set `ALLOW_DANGEROUS_FN=true` di `.env`. **Disarankan tidak.**
+
+### 3. Sensor RPC URL pada output
+
+Output skrip otomatis menyensor:
+- _Basic auth_ di URL (`user:pass@host`)
+- _Path segment_ panjang (≥16 karakter — pola Alchemy/Infura key)
+- _Query parameter_: `key`, `apikey`, `api_key`, `token`, `auth`, `secret`, `access_token`, `password`
+
+Aman untuk _share_ keluaran terminal saat _troubleshooting_.
+
+### 4. Lockfile dependency
+
+Repo ini menyertakan `package-lock.json` agar `npm install` selalu menghasilkan _dependency tree_ yang sama (mencegah _supply-chain attack_ via versi transitive yang berubah). Kalau Anda butuh _override_, gunakan `npm ci` daripada `npm install` di lingkungan production.
+
 ## Pemecahan Masalah
 
 | Pesan error | Penyebab umum | Solusi |
@@ -193,7 +243,99 @@ Transaksi yang dikirim lewat endpoint ini **tidak masuk mempool publik**, sehing
 | `Total biaya ... melebihi batas` | Gas + value > `MAX_TOTAL_COST_ETH`. | Sesuaikan batas atau kurangi `QUANTITY`. |
 | `Saldo wallet ... kurang dari estimasi` | Burner wallet kurang ETH. | Top up wallet dengan ETH yang cukup. |
 | `Jumlah argumen tidak cocok` | `MINT_ARGS` jumlahnya salah. | Hitung ulang sesuai `MINT_FN`. |
+| `Broadcast diblokir oleh hardening gate` | `LIVE_MINT_APPROVED` belum di-set. | Set `LIVE_MINT_APPROVED=yes` di `.env` (lihat [Hardening](#hardening-production)). |
+| `MINT_FN ... adalah fungsi yang berpotensi berbahaya` | Anda menulis fungsi non-mint (mis. `approve`). | Pastikan `MINT_FN` adalah fungsi mint kontrak. Kalau memang sengaja, set `ALLOW_DANGEROUS_FN=true`. |
 
 ## Lisensi
 
 [MIT](./LICENSE)
+
+
+
+---
+
+## Mode Sniper (Instant Execution)
+
+Untuk skenario di mana Anda butuh **eksekusi mint secepat mungkin** saat _mint window_ live dibuka — tanpa simulasi, tanpa prompt, tanpa _double approval_:
+
+```bash
+npm run sniper
+```
+
+### Filosofi sniper mode
+
+- **Pre-flight (sekali, sebelum mint window):** validasi chain, resolve ENS, verifikasi bytecode, _denylist check_, encode calldata, cache nonce & baseFee.
+- **Hot path (saat mint live):** refresh nonce → refresh baseFee → sign → broadcast paralel ke semua RPC.
+- **Tidak ada simulasi, prompt, atau dry-run di hot path.**
+
+Latensi tipikal hot path: ~50-200ms tergantung RPC + jaringan.
+
+### Mode trigger
+
+| `TRIGGER_MODE` | Perilaku |
+| --- | --- |
+| `immediate` | Fire langsung saat skrip dijalankan |
+| `poll` | Poll _view function_, fire saat return value cocok `TRIGGER_EXPECT` |
+| `timestamp` | Tunggu sampai `TRIGGER_TIMESTAMP` (Unix detik), lalu fire |
+| `block` | Tunggu sampai `blockNumber >= TRIGGER_BLOCK`, lalu fire |
+
+### Konfigurasi sniper
+
+| Variabel | Default | Deskripsi |
+| --- | --- | --- |
+| `TRIGGER_MODE` | `immediate` | Salah satu dari di atas |
+| `TRIGGER_FN` | `mintActive() returns (bool)` | View fn untuk mode `poll` |
+| `TRIGGER_EXPECT` | `true` | Nilai return yang men-trigger fire |
+| `POLL_MS` | `200` | Jeda antar poll dalam milidetik |
+| `TRIGGER_TIMESTAMP` | `0` | Unix epoch detik untuk mode `timestamp` |
+| `TRIGGER_BLOCK` | `0` | Block number untuk mode `block` |
+| `EXTRA_RPC_URLS` | _(kosong)_ | RPC tambahan untuk parallel broadcast (comma-separated) |
+| `STATIC_GAS_LIMIT` | `300000` | Gas limit statik (skip `estimateGas`) |
+| `SNIPER_PRIORITY_GWEI` | `3` | Priority fee untuk inclusion cepat |
+| `SNIPER_BYPASS_FEE_CAP` | `false` | Bypass `MAX_FEE_GWEI` cap (HATI-HATI) |
+| `WAIT_FOR_CONFIRMATION` | `false` | `true` = tunggu 1 konfirmasi, `false` = fire-and-forget |
+
+### Optimasi yang aktif
+
+- ⚡ **Multi-RPC parallel broadcast** — broadcast ke `RPC_URL` + semua `EXTRA_RPC_URLS` sekaligus, race siapa duluan accept
+- ⚡ **Pre-built calldata** — encoded sekali di pre-flight, dipakai ulang
+- ⚡ **Static gas limit** — skip `estimateGas` (~50-100ms saving)
+- ⚡ **Aggressive fee** — `maxFee = 3 × baseFee + tip` untuk masuk blok awal
+- ⚡ **Fire-and-forget** — return setelah RPC accept, tidak tunggu konfirmasi (opt-in `WAIT_FOR_CONFIRMATION=true` kalau perlu)
+
+### Safety yang TETAP aktif (zero hot-path overhead)
+
+Validasi berikut dilakukan **sekali di pre-flight**, tidak menambah latensi saat mint live:
+
+- Chain ID = 1 guard
+- Bytecode existence check
+- Dangerous function denylist (`approve`, `setApprovalForAll`, dll.)
+- Fee cap (`MAX_FEE_GWEI`) — kecuali `SNIPER_BYPASS_FEE_CAP=true`
+- Burner wallet konvensi
+
+### Contoh: sniper untuk mint di waktu tertentu
+
+```env
+TRIGGER_MODE=timestamp
+TRIGGER_TIMESTAMP=1735689600          # 1 Jan 2025 00:00 UTC
+EXTRA_RPC_URLS=https://eth.llamarpc.com,https://rpc.ankr.com/eth
+STATIC_GAS_LIMIT=250000
+SNIPER_PRIORITY_GWEI=5
+WAIT_FOR_CONFIRMATION=false
+```
+
+### Contoh: sniper dengan poll fungsi `mintActive()`
+
+```env
+TRIGGER_MODE=poll
+TRIGGER_FN=mintActive() returns (bool)
+TRIGGER_EXPECT=true
+POLL_MS=150
+EXTRA_RPC_URLS=https://eth.llamarpc.com
+```
+
+### Catatan keamanan untuk mode sniper
+
+- **WAJIB pakai burner wallet.** Mode ini broadcast tanpa konfirmasi. Kesalahan konfigurasi = kehilangan saldo wallet.
+- **Test dulu di mainnet dengan mint murah** sebelum dipakai untuk NFT bernilai tinggi.
+- **`SNIPER_BYPASS_FEE_CAP=true` adalah pintu yolo** — kalau RPC ngasih baseFee absurd (mis. bug atau attack), tx Anda bisa burn ETH banyak. Default `false` direkomendasikan.

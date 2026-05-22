@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dry": "node src/index.js --dry-run",
-    "send": "node src/index.js --send"
+    "send": "node src/index.js --send",
+    "sniper": "node src/index.js --sniper"
   },
   "engines": {
     "node": ">=18"
